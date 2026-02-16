@@ -2,18 +2,23 @@
 
 namespace App\Controllers;
 
-use App\Infrastructure\Database;
+use App\Infrastructure\Logger;
 use PDO;
 
 class HealthController
 {
+    private PDO $pdo;
+
+    public function __construct(PDO $pdo)
+    {
+        $this->pdo = $pdo;
+    }
+
     public function db(): array
     {
-        $pdo = null;
+        $pdo = $this->pdo;
 
         try {
-            $pdo = Database::getConnection();
-
             $database = $pdo->query('SELECT current_database()')->fetchColumn();
             $schema = $pdo->query('SELECT current_schema()')->fetchColumn();
 
@@ -21,15 +26,17 @@ class HealthController
 
             $pdo->beginTransaction();
 
-            $stmt = $pdo->prepare("
+            $stmt = $pdo->prepare(
+                "
                 INSERT INTO public.deals (bitrix_deal_id, amount_rub, status)
                 VALUES (:deal_id, :amount_rub, 'healthcheck')
                 RETURNING id, bitrix_deal_id, amount_rub, status
-            ");
+                "
+            );
 
             $stmt->execute([
                 ':deal_id' => $probeDealId,
-                ':amount_rub' => 0.01,
+                ':amount_rub' => '0.01',
             ]);
 
             $probe = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -41,25 +48,31 @@ class HealthController
             $pdo->rollBack();
 
             http_response_code(200);
-
             return [
                 'status' => 'ok',
                 'database' => $database,
                 'schema' => $schema,
                 'insert_test' => 'ok_rolled_back',
                 'probe' => $probe,
+                'request_id' => Logger::getRequestId(),
             ];
         } catch (\Throwable $e) {
-            if ($pdo instanceof PDO && $pdo->inTransaction()) {
+            if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
+
+            Logger::error(
+                'Database health check failed.',
+                ['error' => $e->getMessage()],
+                'HEALTH_DB_FAILED'
+            );
 
             http_response_code(500);
 
             return [
                 'status' => 'error',
-                'message' => 'Database health check failed',
-                'details' => $e->getMessage(),
+                'message' => 'Internal error',
+                'request_id' => Logger::getRequestId(),
             ];
         }
     }

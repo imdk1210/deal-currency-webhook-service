@@ -2,7 +2,12 @@
 vendor/
 storage/*.log
 storage/logs/*.txt
+storage/logs/*.log
+storage/logs/*.json
+storage/logs/*.xml
+storage/cache/*.json
 .phpunit.result.cache
+.phpunit.cache/
 .idea/
 .vscode/
 .DS_Store

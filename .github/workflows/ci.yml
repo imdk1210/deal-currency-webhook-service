@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: middleware
+          POSTGRES_USER: appuser
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U appuser -d middleware"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: middleware
+      DB_USER: appuser
+      DB_PASS: secret
+      WEBHOOK_TOKEN: my_secret_token
+      WEBHOOK_HMAC_SECRET: my_hmac_secret
+      WEBHOOK_TIMESTAMP_TOLERANCE_SEC: 300
+      WEBHOOK_PROCESSING_BUDGET_MS: 12000
+      CURRENCY_API_RETRIES: 2
+      CURRENCY_API_BACKOFF_MS: 50
+      CURRENCY_CACHE_TTL_SEC: 60
+      CURRENCY_API_INSECURE_SSL: 0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_pgsql, curl, bcmath
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Run migrations
+        run: composer run migrate
+
+      - name: PHP syntax check
+        run: find app bin config public routes tests -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Run tests
+        run: composer run test

@@ -2,94 +2,218 @@
 
 namespace App\Services;
 
-use App\Infrastructure\Database;
 use App\Infrastructure\Logger;
+use App\Support\Money;
 use PDO;
 use RuntimeException;
 
 class DealCurrencyService
 {
-    public function handle(array $data): array
+    private PDO $pdo;
+    private CurrencyApiService $currencyApi;
+
+    public function __construct(PDO $pdo, ?CurrencyApiService $currencyApi = null)
     {
-        $pdo = Database::getConnection();
-        $currencyApi = new CurrencyApiService();
+        $this->pdo = $pdo;
+        $this->currencyApi = $currencyApi ?? new CurrencyApiService();
+    }
 
-        $deal = $this->upsertReceived($pdo, $data);
+    public function handle(array $data, int $eventTimestamp): array
+    {
+        $deal = $this->upsertReceived($data, $eventTimestamp);
 
-        try {
-            $rate = $currencyApi->getRubToUsdRate();
-            $amountUsd = round(((float) $deal['amount_rub']) * $rate, 2);
-
-            $this->markConverted($pdo, (int) $deal['id'], $amountUsd, $rate);
-
+        if (($deal['stale'] ?? false) === true) {
             Logger::info(
-                sprintf(
-                    'Deal %d converted: RUB=%s USD=%s rate=%s',
-                    (int) $deal['bitrix_deal_id'],
-                    (string) $deal['amount_rub'],
-                    (string) $amountUsd,
-                    (string) $rate
-                )
+                'Ignoring stale webhook event.',
+                [
+                    'deal_id' => (int) $deal['bitrix_deal_id'],
+                    'event_timestamp' => $eventTimestamp,
+                    'stored_source_updated_at' => (string) $deal['source_updated_at'],
+                ],
+                'DEAL_STALE_EVENT'
             );
 
             return [
                 'deal_id' => (int) $deal['bitrix_deal_id'],
-                'amount_rub' => (float) $deal['amount_rub'],
+                'status' => 'ignored_stale_event',
+            ];
+        }
+
+        try {
+            $rate = $this->currencyApi->getRubToUsdRate();
+            $rubMinorUnits = Money::decimalToMinorUnits((string) $deal['amount_rub'], 2);
+            $usdMinorUnits = Money::multiplyMinorByRate($rubMinorUnits, $rate, 2);
+
+            $amountUsd = Money::minorUnitsToDecimalString($usdMinorUnits, 2);
+            $updated = $this->markConverted((int) $deal['id'], $amountUsd, $rate, $eventTimestamp);
+
+            if (!$updated) {
+                Logger::info(
+                    'Skipping conversion result because a newer event already updated the deal.',
+                    [
+                        'deal_id' => (int) $deal['bitrix_deal_id'],
+                        'event_timestamp' => $eventTimestamp,
+                    ],
+                    'DEAL_SUPERSEDED'
+                );
+
+                return [
+                    'deal_id' => (int) $deal['bitrix_deal_id'],
+                    'status' => 'ignored_stale_event',
+                ];
+            }
+
+            Logger::info(
+                'Deal converted successfully.',
+                [
+                    'deal_id' => (int) $deal['bitrix_deal_id'],
+                    'amount_rub' => (string) $deal['amount_rub'],
+                    'amount_usd' => $amountUsd,
+                    'rate' => $rate,
+                ],
+                'DEAL_CONVERTED'
+            );
+
+            return [
+                'deal_id' => (int) $deal['bitrix_deal_id'],
+                'amount_rub' => (string) $deal['amount_rub'],
                 'amount_usd' => $amountUsd,
                 'rate' => $rate,
                 'status' => 'converted',
             ];
         } catch (\Throwable $e) {
-            $this->markFailed($pdo, (int) $deal['id']);
-            Logger::error('Deal conversion failed for bitrix_deal_id=' . (string) $deal['bitrix_deal_id'] . ': ' . $e->getMessage());
+            $this->markFailed((int) $deal['id'], $eventTimestamp);
+
+            Logger::error(
+                'Deal conversion failed.',
+                [
+                    'deal_id' => (int) $deal['bitrix_deal_id'],
+                    'event_timestamp' => $eventTimestamp,
+                    'error' => $e->getMessage(),
+                ],
+                'DEAL_CONVERSION_FAILED'
+            );
+
             throw $e;
         }
     }
 
-    private function upsertReceived(PDO $pdo, array $data): array
+    private function upsertReceived(array $data, int $eventTimestamp): array
     {
-        $pdo->beginTransaction();
+        $this->pdo->beginTransaction();
 
         try {
-            $stmt = $pdo->prepare("\n                INSERT INTO public.deals (bitrix_deal_id, amount_rub, status)\n                VALUES (:deal_id, :amount_rub, 'received')\n                ON CONFLICT (bitrix_deal_id)\n                DO UPDATE SET\n                    amount_rub = EXCLUDED.amount_rub,\n                    status = 'received',\n                    amount_usd = NULL,\n                    exchange_rate = NULL\n                RETURNING id, bitrix_deal_id, amount_rub, status\n            ");
+            $rubMinorUnits = Money::decimalToMinorUnits($data['amount'], 2);
+            $amountRub = Money::minorUnitsToDecimalString($rubMinorUnits, 2);
+
+            $stmt = $this->pdo->prepare(
+                "
+                INSERT INTO public.deals (bitrix_deal_id, amount_rub, status, source_updated_at)
+                VALUES (:deal_id, :amount_rub, 'received', to_timestamp(:event_ts))
+                ON CONFLICT (bitrix_deal_id)
+                DO UPDATE SET
+                    amount_rub = EXCLUDED.amount_rub,
+                    status = 'received',
+                    amount_usd = NULL,
+                    exchange_rate = NULL,
+                    source_updated_at = EXCLUDED.source_updated_at
+                WHERE public.deals.source_updated_at IS NULL
+                   OR EXCLUDED.source_updated_at >= public.deals.source_updated_at
+                RETURNING id, bitrix_deal_id, amount_rub, status, source_updated_at
+                "
+            );
 
             $stmt->execute([
-                ':deal_id' => $data['deal_id'],
-                ':amount_rub' => $data['amount'],
+                ':deal_id' => (int) $data['deal_id'],
+                ':amount_rub' => $amountRub,
+                ':event_ts' => $eventTimestamp,
             ]);
 
             $deal = $stmt->fetch(PDO::FETCH_ASSOC);
+
             if (!$deal) {
-                throw new RuntimeException('Upsert failed.');
+                $existing = $this->getExistingDeal((int) $data['deal_id']);
+                if (!$existing) {
+                    throw new RuntimeException('Upsert did not return a deal and existing row was not found.');
+                }
+
+                $existing['stale'] = true;
+                $this->pdo->commit();
+
+                return $existing;
             }
 
-            $pdo->commit();
+            $deal['stale'] = false;
+            $this->pdo->commit();
 
             return $deal;
         } catch (\Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
             }
             throw $e;
         }
     }
 
-    private function markConverted(PDO $pdo, int $id, float $amountUsd, float $rate): void
+    private function getExistingDeal(int $dealId): ?array
     {
-        $stmt = $pdo->prepare("\n            UPDATE public.deals\n            SET amount_usd = :amount_usd,\n                exchange_rate = :rate,\n                status = 'converted'\n            WHERE id = :id\n        ");
+        $stmt = $this->pdo->prepare(
+            "
+            SELECT id, bitrix_deal_id, amount_rub, status, source_updated_at
+            FROM public.deals
+            WHERE bitrix_deal_id = :deal_id
+            LIMIT 1
+            "
+        );
+
+        $stmt->execute([':deal_id' => $dealId]);
+        $deal = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return $deal ?: null;
+    }
+
+    private function markConverted(
+        int $id,
+        string $amountUsd,
+        string $rate,
+        int $eventTimestamp
+    ): bool {
+        $stmt = $this->pdo->prepare(
+            "
+            UPDATE public.deals
+            SET amount_usd = :amount_usd,
+                exchange_rate = :rate,
+                status = 'converted'
+            WHERE id = :id
+              AND source_updated_at = to_timestamp(:event_ts)
+            "
+        );
 
         $stmt->execute([
             ':amount_usd' => $amountUsd,
             ':rate' => $rate,
             ':id' => $id,
+            ':event_ts' => $eventTimestamp,
         ]);
+
+        return $stmt->rowCount() > 0;
     }
 
-    private function markFailed(PDO $pdo, int $id): void
+    private function markFailed(int $id, int $eventTimestamp): void
     {
         try {
-            $stmt = $pdo->prepare("\n                UPDATE public.deals\n                SET status = 'failed'\n                WHERE id = :id\n            ");
-            $stmt->execute([':id' => $id]);
+            $stmt = $this->pdo->prepare(
+                "
+                UPDATE public.deals
+                SET status = 'failed'
+                WHERE id = :id
+                  AND source_updated_at = to_timestamp(:event_ts)
+                "
+            );
+            $stmt->execute([
+                ':id' => $id,
+                ':event_ts' => $eventTimestamp,
+            ]);
         } catch (\Throwable $e) {
             // Do not mask the original conversion error.
         }

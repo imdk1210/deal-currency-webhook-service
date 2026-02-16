@@ -4,33 +4,98 @@ namespace App\Infrastructure;
 
 class Logger
 {
-    private const LOG_FILE = __DIR__ . '/../../storage/app.log';
+    private const LOG_FILE = __DIR__ . '/../../storage/logs/app.log';
+    private const MAX_FILE_SIZE_BYTES = 5242880; // 5 MB
+    private const MAX_ROTATED_FILES = 5;
 
-    public static function info(string $message): void
+    private static ?string $requestId = null;
+
+    public static function setRequestId(string $requestId): void
     {
-        self::write('INFO', $message);
+        self::$requestId = $requestId;
     }
 
-    public static function error(string $message): void
+    public static function getRequestId(): ?string
     {
-        self::write('ERROR', $message);
+        return self::$requestId;
     }
 
-    private static function write(string $level, string $message): void
+    public static function info(string $message, array $context = [], string $code = 'INFO'): void
     {
-        $line = sprintf(
-            "[%s] %s: %s%s",
-            date('Y-m-d H:i:s'),
-            $level,
-            $message,
-            PHP_EOL
-        );
+        self::write('INFO', $code, $message, $context);
+    }
 
-        $dir = dirname(self::LOG_FILE);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0777, true);
+    public static function error(string $message, array $context = [], string $code = 'ERROR'): void
+    {
+        self::write('ERROR', $code, $message, $context);
+    }
+
+    private static function write(string $level, string $code, string $message, array $context): void
+    {
+        self::ensureLogDirectory();
+        self::rotateIfNeeded();
+
+        $record = [
+            'timestamp' => gmdate('c'),
+            'level' => $level,
+            'code' => $code,
+            'request_id' => self::$requestId,
+            'message' => $message,
+            'context' => $context,
+        ];
+
+        $line = json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($line === false) {
+            return;
         }
 
-        file_put_contents(self::LOG_FILE, $line, FILE_APPEND);
+        file_put_contents(self::LOG_FILE, $line . PHP_EOL, FILE_APPEND | LOCK_EX);
+    }
+
+    private static function ensureLogDirectory(): void
+    {
+        $dir = dirname(self::LOG_FILE);
+        if (is_dir($dir)) {
+            return;
+        }
+
+        @mkdir($dir, 0750, true);
+    }
+
+    private static function rotateIfNeeded(): void
+    {
+        if (!is_file(self::LOG_FILE)) {
+            return;
+        }
+
+        $size = filesize(self::LOG_FILE);
+        if ($size === false || $size < self::MAX_FILE_SIZE_BYTES) {
+            return;
+        }
+
+        $rotatedFile = sprintf(
+            '%s/app-%s.log',
+            dirname(self::LOG_FILE),
+            gmdate('Ymd-His')
+        );
+
+        @rename(self::LOG_FILE, $rotatedFile);
+        self::pruneRotatedFiles();
+    }
+
+    private static function pruneRotatedFiles(): void
+    {
+        $pattern = dirname(self::LOG_FILE) . '/app-*.log';
+        $files = glob($pattern);
+
+        if (!is_array($files) || count($files) <= self::MAX_ROTATED_FILES) {
+            return;
+        }
+
+        sort($files);
+        $filesToDelete = array_slice($files, 0, count($files) - self::MAX_ROTATED_FILES);
+        foreach ($filesToDelete as $file) {
+            @unlink($file);
+        }
     }
 }

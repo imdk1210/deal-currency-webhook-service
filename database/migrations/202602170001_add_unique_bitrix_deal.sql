@@ -1,5 +1,3 @@
--- Idempotency safeguard for webhook retries.
--- Fails explicitly if duplicates exist, to avoid silent data loss in migrations.
 DO $$
 BEGIN
     IF EXISTS (
